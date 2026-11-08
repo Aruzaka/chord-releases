@@ -1,0 +1,131 @@
+name: Renew Android update catalog
+
+"on":
+  schedule:
+    - cron: '27 4 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Renew even when the catalog has more than four days left
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-development-catalog
+  cancel-in-progress: false
+
+jobs:
+  renew:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: android-updates
+      - name: Verify and renew signed catalog
+        env:
+          CHORD_ANDROID_CATALOG_PRIVATE_KEY: ${{ secrets.CHORD_ANDROID_CATALOG_PRIVATE_KEY }}
+          FORCE_CATALOG_RENEWAL: ${{ inputs.force && 'true' || 'false' }}
+        run: |
+          node --input-type=commonjs <<'NODE'
+          const { lstatSync, readFileSync, writeFileSync } = require('node:fs');
+          const { createPrivateKey, createPublicKey, sign, verify } = require('node:crypto');
+
+          const file = 'android/development/catalog.json';
+          const keyId = 'chord-android-development-p256-1';
+          const pinnedPoint = '0487b1b05d40f2ba09a41ec65ee3ed0c7e38053204aece59a632fe2e11b3d747a4a94f246e96368a34f0921f265801f40e8e15706ad3f2b10719b77ddd0e24e048';
+          const maxBytes = 32_768;
+          const day = 86_400_000;
+          const check = (condition, message) => {
+            if (!condition) throw new Error(message);
+          };
+
+          function canonical(value, depth = 0) {
+            check(depth <= 8, 'Catalog is nested too deeply');
+            if (value === null || typeof value === 'string' || typeof value === 'boolean' || Number.isSafeInteger(value)) {
+              return JSON.stringify(value);
+            }
+            if (Array.isArray(value)) return '[' + value.map(item => canonical(item, depth + 1)).join(',') + ']';
+            check(value && Object.getPrototypeOf(value) === Object.prototype, 'Invalid catalog value');
+            return '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + canonical(value[key], depth + 1)).join(',') + '}';
+          }
+
+          function fields(value, expected) {
+            return value && Object.getPrototypeOf(value) === Object.prototype &&
+              Object.keys(value).length === expected.length && expected.every(key => Object.hasOwn(value, key));
+          }
+
+          function timestamp(value) {
+            const instant = Date.parse(value);
+            check(typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value) &&
+              Number.isFinite(instant) && new Date(instant).toISOString() === value, 'Invalid catalog timestamp');
+            return instant;
+          }
+
+          const stat = lstatSync(file);
+          check(stat.isFile() && stat.size <= maxBytes, 'Catalog must be a regular file of at most 32 KiB');
+          const previous = readFileSync(file);
+          const envelope = JSON.parse(previous.toString('utf8'));
+          check(fields(envelope, ['keyId', 'manifest', 'signature']) && envelope.keyId === keyId &&
+            previous.equals(Buffer.from(canonical(envelope))), 'Catalog envelope is not canonical or uses an unexpected key');
+          const { manifest, signature } = envelope;
+          check(fields(manifest, ['schemaVersion', 'packageName', 'channel', 'sequence', 'publishedAt', 'expiresAt', 'releases']) &&
+            manifest.schemaVersion === 1 && manifest.packageName === 'com.chord.mobile.dev' && manifest.channel === 'development' &&
+            Number.isSafeInteger(manifest.sequence) && manifest.sequence >= 1 && manifest.sequence <= 2_100_000_000 &&
+            Array.isArray(manifest.releases) && manifest.releases.length >= 1 && manifest.releases.length <= 32,
+          'Catalog manifest does not match the Android development feed');
+
+          let privateKey;
+          try { privateKey = createPrivateKey(process.env.CHORD_ANDROID_CATALOG_PRIVATE_KEY || ''); }
+          catch { throw new Error('Catalog signing secret must contain the P-256 private key PEM'); }
+          delete process.env.CHORD_ANDROID_CATALOG_PRIVATE_KEY;
+          const publicKey = createPublicKey(privateKey);
+          const jwk = publicKey.export({ format: 'jwk' });
+          check(jwk.kty === 'EC' && jwk.crv === 'P-256' &&
+            Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]).toString('hex') === pinnedPoint,
+          'Catalog signing key does not match the application trust pin');
+
+          check(typeof signature === 'string' && /^[A-Za-z0-9_-]{86}$/.test(signature), 'Invalid catalog signature encoding');
+          const previousSignature = Buffer.from(signature, 'base64url');
+          check(previousSignature.length === 64 && previousSignature.toString('base64url') === signature &&
+            verify('sha256', Buffer.from(canonical(manifest)), { key: publicKey, dsaEncoding: 'ieee-p1363' }, previousSignature),
+          'Existing catalog signature failed verification');
+
+          const now = Date.now(), published = timestamp(manifest.publishedAt), expires = timestamp(manifest.expiresAt);
+          check(published <= now && expires > published && expires - published <= 7 * day, 'Invalid catalog validity window');
+          if (process.env.FORCE_CATALOG_RENEWAL !== 'true' && expires - now > 4 * day) {
+            console.log('Verified catalog has more than four days remaining.');
+          } else {
+            check(manifest.sequence < 2_100_000_000, 'Catalog sequence cannot be incremented');
+            const next = {
+              ...manifest,
+              sequence: manifest.sequence + 1,
+              publishedAt: new Date(now).toISOString(),
+              expiresAt: new Date(now + 7 * day).toISOString(),
+            };
+            const bytes = Buffer.from(canonical(next));
+            const nextSignature = sign('sha256', bytes, { key: privateKey, dsaEncoding: 'ieee-p1363' });
+            check(verify('sha256', bytes, { key: publicKey, dsaEncoding: 'ieee-p1363' }, nextSignature), 'Renewed signature failed verification');
+            const renewed = canonical({ keyId, manifest: next, signature: nextSignature.toString('base64url') });
+            check(Buffer.byteLength(renewed) <= maxBytes, 'Renewed catalog exceeds 32 KiB');
+            writeFileSync(file, renewed);
+            console.log('Renewed Android catalog sequence ' + next.sequence + '.');
+          }
+          NODE
+      - name: Commit and publish only the catalog
+        run: |
+          catalog=android/development/catalog.json
+          if git diff --quiet -- "$catalog"; then
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit --only -m 'Renew Android development update catalog' -- "$catalog"
+          git push origin HEAD:refs/heads/android-updates
